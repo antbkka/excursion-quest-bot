@@ -425,6 +425,13 @@ class AdminStates(StatesGroup):
     promo_text = State()
 
 
+class QuestStates(StatesGroup):
+    """Состояния машины состояний гостевого квеста."""
+
+    # Гость нажал «📍 Локация N пройдена» — ждём от него кодовое слово
+    waiting_code = State()
+
+
 # ─────────────────────────────────────────────────────────────
 # Handlers — слой обработчиков aiogram
 # ─────────────────────────────────────────────────────────────
@@ -529,6 +536,94 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
             ]
         )
 
+    # ───────── Хелперы квеста ─────────
+
+    def _next_unpassed_point(user_id: int) -> Optional[sqlite3.Row]:
+        """Возвращает первую непройденную пользователем точку (по order_num)."""
+        passed_ids: set[int] = {
+            row["id"] for row in db.get_user_passed_points(user_id)
+        }
+        for p in db.get_all_points():
+            if p["id"] not in passed_ids:
+                return p
+        return None
+
+    def _all_points_keyboard(user_id: int) -> InlineKeyboardMarkup:
+        """
+        Возвращает «табло» — по одной кнопке на каждую НЕпройденную локацию.
+        Пройденные локации не отображаются.
+        callback_data: "quest:pick:<point_id>".
+        """
+        passed_ids: set[int] = {
+            row["id"] for row in db.get_user_passed_points(user_id)
+        }
+        rows: list[list[InlineKeyboardButton]] = []
+        for p in db.get_all_points():
+            if p["id"] in passed_ids:
+                continue
+            label = f"📍 {html.quote(p['name'])}"
+            rows.append(
+                [InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"quest:pick:{p['id']}",
+                )]
+            )
+        if not rows:
+            # На всякий случай — если все точки вдруг пройдены.
+            rows.append(
+                [InlineKeyboardButton(
+                    text="🏆 КВЕСТ ПРОЙДЕН",
+                    callback_data="quest:finished",
+                )]
+            )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _quest_finished_keyboard() -> InlineKeyboardMarkup:
+        """Финальная клавиатура: «🏆 КВЕСТ ПРОЙДЕН»."""
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🏆 КВЕСТ ПРОЙДЕН",
+                    callback_data="quest:finished",
+                )]
+            ]
+        )
+
+    def _quest_board_text(user_id: int) -> str:
+        """
+        Текст для табло: прогресс X/Y и список оставшихся локаций.
+        """
+        passed = db.get_user_progress_count(user_id)
+        total = db.count_points()
+        if total == 0:
+            return "ℹ️ Квест ещё не настроен: администратор не добавил точки маршрута."
+
+        passed_ids: set[int] = {
+            row["id"] for row in db.get_user_passed_points(user_id)
+        }
+        remaining = [p for p in db.get_all_points() if p["id"] not in passed_ids]
+
+        lines = [
+            f"🗺 <b>Табло локаций</b>",
+            f"📊 Прогресс: <b>{passed}/{total}</b>",
+            "",
+        ]
+        if not remaining:
+            lines.append("Все локации пройдены! Нажмите кнопку ниже. 👇")
+        else:
+            lines.append("Выберите локацию, у которой нашли кодовое слово:")
+            lines.append("")
+            for p in remaining:
+                lines.append(
+                    f"• 📍 <b>{html.quote(p['name'])}</b> "
+                    f"<i>(порядок {p['order_num']})</i>"
+                )
+        return "\n".join(lines)
+
+    # Алиас для совместимости со старыми хендлерами.
+    def _quest_progress_keyboard(user_id: int) -> InlineKeyboardMarkup:
+        return _all_points_keyboard(user_id)
+
     # ───────── /start ─────────
     @router.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext) -> None:
@@ -546,9 +641,10 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
         text = (
             "👋 <b>Добро пожаловать на интерактивную экскурсию!</b>\n\n"
             "Ниже — файл с описанием маршрута. "
-            "На каждой точке спрятано кодовое слово. "
-            "Найдите его и отправьте сюда одним сообщением.\n\n"
-            "Когда пройдёте все точки — откроется кнопка для подписки на акции 🎁"
+            "На каждой точке спрятано кодовое слово.\n\n"
+            "Когда найдёте кодовое слово — нажмите кнопку ниже "
+            "(«📍 Локация N пройдена»). Бот попросит ввести его.\n\n"
+            "Когда все точки пройдены — появится кнопка «🏆 КВЕСТ ПРОЙДЕН» 🎁"
         )
 
         if settings.excursion_file_path.exists():
@@ -572,6 +668,25 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
                 text
                 + "\n\n⚠️ Файл экскурсии временно недоступен, "
                   "обратитесь к администратору."
+            )
+
+        # Предлагаем начать/продолжить квест.
+        total = db.count_points()
+        if total == 0:
+            await message.answer(
+                "ℹ️ Квест ещё не настроен: администратор не добавил точки маршрута."
+            )
+        else:
+            await message.answer(
+                "🗺 Нажмите кнопку ниже, чтобы открыть табло локаций:",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text="▶️ Начать квест",
+                            callback_data="quest:start",
+                        )]
+                    ]
+                ),
             )
 
         # Если это админ — сразу покажем подсказку про /admin
@@ -1614,8 +1729,12 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
         )
         text = (
             "ℹ️ <b>Помощь</b>\n\n"
-            "Отправьте кодовое слово с точки экскурсии в чат.\n"
-            "Когда все точки будут пройдены, появится кнопка для подписки на акции."
+            "Введите <code>/start</code> и нажмите кнопку «▶️ Начать квест».\n\n"
+            "Откроется табло со всеми локациями. "
+            "Когда найдёте кодовое слово — нажмите кнопку с этой локацией, "
+            "бот попросит ввести слово. После прохождения локация исчезает из табло.\n\n"
+            "Локации можно проходить в любом порядке.\n\n"
+            "Когда все локации пройдены — появится кнопка «🏆 КВЕСТ ПРОЙДЕН»."
         )
         if is_user_admin:
             text += (
@@ -1633,17 +1752,272 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
             )
         await message.answer(text)
 
-    # ───────── Callback: «Прошёл всю экскурсию» ─────────
-    @router.callback_query(F.data == "finished")
-    async def on_finished(callback: CallbackQuery) -> None:
+    # ───────── Квест: кнопка «▶️ Начать квест» → табло локаций ─────────
+    @router.callback_query(F.data == "quest:start")
+    async def cb_quest_start(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not callback.from_user:
+            return
+        user_id = callback.from_user.id
+
+        # Если идёт ввод кода — не сбрасываем, пусть доведёт до конца.
+        cur = await state.get_state()
+        if cur == QuestStates.waiting_code.state:
+            await callback.answer(
+                "Сначала введите кодовое слово для выбранной локации.",
+                show_alert=True,
+            )
+            return
+
+        total = db.count_points()
+        if total == 0:
+            await callback.answer(
+                "Квест ещё не настроен.", show_alert=True
+            )
+            return
+
+        if db.has_completed_all(user_id):
+            await callback.answer()
+            if callback.message:
+                try:
+                    await callback.message.edit_text(
+                        "🎉 Вы уже прошли весь маршрут!\n"
+                        "Нажмите кнопку ниже, чтобы подтвердить:",
+                        reply_markup=_quest_finished_keyboard(),
+                    )
+                except Exception:
+                    await callback.message.answer(
+                        "🎉 Вы уже прошли весь маршрут!",
+                        reply_markup=_quest_finished_keyboard(),
+                    )
+            return
+
+        await state.clear()
+        text = _quest_board_text(user_id)
+        kb = _all_points_keyboard(user_id)
+        if callback.message:
+            try:
+                await callback.message.edit_text(text, reply_markup=kb)
+            except Exception:
+                await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+
+    # ───────── Квест: гость выбрал конкретную локацию из табло ─────────
+    @router.callback_query(F.data.startswith("quest:pick:"))
+    async def cb_quest_pick(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not callback.from_user:
+            return
+        user_id = callback.from_user.id
+
+        raw_id = callback.data.split(":")[-1]  # type: ignore[union-attr]
+        try:
+            point_id = int(raw_id)
+        except ValueError:
+            await callback.answer("Некорректный запрос.", show_alert=True)
+            return
+
+        point = db.get_point_by_id(point_id)
+        if point is None:
+            await callback.answer("Локация не найдена.", show_alert=True)
+            return
+
+        if db.has_passed_point(user_id, point_id):
+            await callback.answer(
+                "Эта локация уже пройдена.", show_alert=True
+            )
+            # Обновим табло — пройденная исчезнет.
+            if callback.message and callback.message.text:
+                try:
+                    await callback.message.edit_reply_markup(
+                        reply_markup=_all_points_keyboard(user_id)
+                    )
+                except Exception:
+                    pass
+            return
+
+        cur = await state.get_state()
+        if cur == QuestStates.waiting_code.state:
+            await callback.answer(
+                "Сначала введите кодовое слово для текущей локации.",
+                show_alert=True,
+            )
+            return
+
+        # Переводим гостя в FSM и просим кодовое слово.
+        await state.set_state(QuestStates.waiting_code)
+        await state.update_data(
+            quest_point_id=point_id,
+            quest_board_message_id=callback.message.message_id
+            if callback.message else None,
+        )
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Отмена", callback_data="quest:cancel")]
+            ]
+        )
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    f"🔐 Вы выбрали локацию «{html.quote(point['name'])}».\n\n"
+                    f"Введите <b>кодовое слово</b> для неё:",
+                    reply_markup=kb,
+                )
+            except Exception:
+                await callback.message.answer(
+                    f"🔐 Введите <b>кодовое слово</b> для локации "
+                    f"«{html.quote(point['name'])}»:",
+                    reply_markup=kb,
+                )
+        await callback.answer()
+
+    @router.callback_query(
+        F.data == "quest:cancel",
+        StateFilter(QuestStates.waiting_code),
+    )
+    async def cb_quest_cancel(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await state.clear()
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    "Ввод кодового слова отменён.",
+                    reply_markup=(
+                        _quest_progress_keyboard(callback.from_user.id)
+                        if callback.from_user else None
+                    ),
+                )
+            except Exception:
+                pass
+        await callback.answer()
+
+    @router.message(StateFilter(QuestStates.waiting_code))
+    async def st_quest_waiting_code(
+        message: Message, state: FSMContext
+    ) -> None:
+        if not message.from_user or not message.text:
+            await message.answer(
+                "Пожалуйста, отправьте кодовое слово текстом."
+            )
+            return
+        user_id = message.from_user.id
+        data = await state.get_data()
+        point_id = data.get("quest_point_id")
+        if point_id is None:
+            await state.clear()
+            await message.answer(
+                "Состояние устарело. Начните заново.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text="▶️ Начать квест",
+                            callback_data="quest:start",
+                        )]
+                    ]
+                ),
+            )
+            return
+
+        point = db.get_point_by_id(int(point_id))
+        if point is None:
+            await state.clear()
+            await message.answer(
+                "❌ Локация больше не существует.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text="▶️ Начать квест",
+                            callback_data="quest:start",
+                        )]
+                    ]
+                ),
+            )
+            return
+
+        word_input = message.text.strip()
+        if not word_input:
+            await message.answer(
+                "Кодовое слово не может быть пустым. Попробуйте ещё раз:"
+            )
+            return
+
+        if db.has_passed_point(user_id, point["id"]):
+            await state.clear()
+            await message.answer(
+                "ℹ️ Эта локация уже пройдена.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text="▶️ Начать квест",
+                            callback_data="quest:start",
+                        )]
+                    ]
+                ),
+            )
+            return
+
+        # Сравниваем без учёта регистра
+        if word_input.lower() != point["code_word"].strip().lower():
+            await message.answer("❌ Неверно. Попробуйте ещё раз.")
+            # Состояние НЕ сбрасываем — пусть попробует снова.
+            return
+
+        # Засчитываем точку
+        db.add_progress(user_id, point["id"])
+        logger.info(
+            "Пользователь %s прошёл локацию #%s '%s'",
+            user_id,
+            point["id"],
+            html.quote(point["name"]),
+        )
+        await state.clear()
+
+        passed = db.get_user_progress_count(user_id)
+        total = db.count_points()
+
+        if db.has_completed_all(user_id):
+            # Все точки пройдены — показываем «КВЕСТ ПРОЙДЕН»
+            await message.answer(
+                f"✅ Локация «{html.quote(point['name'])}» пройдена!\n"
+                f"📊 Прогресс: <b>{passed}/{total}</b>.\n\n"
+                "🎉 <b>Поздравляем!</b> Вы прошли весь маршрут!\n"
+                "Нажмите кнопку ниже, чтобы подтвердить и подписаться на акции 🎁",
+                reply_markup=_quest_finished_keyboard(),
+            )
+        else:
+            # Обновляем табло: пройденная локация исчезает.
+            await message.answer(
+                f"✅ Локация «{html.quote(point['name'])}» пройдена!\n"
+                f"📊 Прогресс: <b>{passed}/{total}</b>.\n\n"
+                "🗺 Выберите следующую локацию:",
+                reply_markup=_all_points_keyboard(user_id),
+            )
+
+    # ───────── Квест: «🏆 КВЕСТ ПРОЙДЕН» ─────────
+    @router.callback_query(F.data == "quest:finished")
+    async def cb_quest_finished(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await state.clear()
         if not callback.from_user:
             return
         user_id = callback.from_user.id
 
         if not db.has_completed_all(user_id):
             await callback.answer(
-                "Вы ещё не прошли все точки экскурсии.", show_alert=True
+                "Вы ещё не прошли все точки маршрута.", show_alert=True
             )
+            if callback.message:
+                try:
+                    await callback.message.edit_reply_markup(
+                        reply_markup=_quest_progress_keyboard(user_id)
+                    )
+                except Exception:
+                    pass
             return
 
         db.mark_user_passed(user_id)
@@ -1654,89 +2028,78 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
                 "Спасибо! Теперь вы будете получать наши акции и новости. 🎁"
             )
 
-    # ───────── Любой текст → проверка кодового слова (В САМОМ КОНЦЕ!) ─────────
+    # ───────── Совместимость со старой кнопкой «finished» ─────────
+    @router.callback_query(F.data == "finished")
+    async def on_finished_legacy(callback: CallbackQuery) -> None:
+        # Перенаправляем на новый унифицированный хендлер
+        if not callback.from_user:
+            return
+        user_id = callback.from_user.id
+        if not db.has_completed_all(user_id):
+            await callback.answer(
+                "Вы ещё не прошли все точки экскурсии.", show_alert=True
+            )
+            if callback.message:
+                try:
+                    await callback.message.edit_reply_markup(
+                        reply_markup=_quest_progress_keyboard(user_id)
+                    )
+                except Exception:
+                    pass
+            return
+        db.mark_user_passed(user_id)
+        await callback.answer("Спасибо! 🎉")
+        if callback.message:
+            await callback.message.answer(
+                "Спасибо! Теперь вы будете получать наши акции и новости. 🎁"
+            )
+
+    # ───────── Любой текст вне FSM → подсказка с кнопкой (В САМОМ КОНЦЕ!) ─────────
     @router.message(F.text)
     async def handle_codeword(message: Message, state: FSMContext) -> None:
-        # Если пользователь в FSM-состоянии — не перехватываем.
-        # (FSM-хэндлеры выше зарегистрированы раньше и сработают первыми,
-        # но если пользователь вышел из них не через /admin, защитимся явно.)
+        """
+        Если пользователь не в FSM и просто прислал текст — это не команда
+        и не кодовое слово (код проверяется в стейте QuestStates.waiting_code).
+        Реагируем мягкой подсказкой: «Нажмите кнопку «📍 Локация N пройдена»».
+        """
         cur = await state.get_state()
         if cur is not None:
+            return  # активный стейт перехватит сообщение
+
+        if not message.from_user:
             return
 
-        if not message.from_user or not message.text:
-            return
         user = message.from_user
         db.upsert_user(user.id, user.username, user.first_name)
 
-        text = message.text.strip()
-        if not text:
+        total = db.count_points()
+        if total == 0:
+            await message.answer(
+                "ℹ️ Квест ещё не настроен: администратор не добавил точки маршрута."
+            )
             return
 
-        # Если все точки уже пройдены — подсказываем, что делать
         if db.has_completed_all(user.id):
             await message.answer(
-                "✅ Вы уже прошли всю экскурсию!\n"
-                "Если ещё не подписались на акции — нажмите кнопку ниже.",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="🎁 Прошёл всю экскурсию",
-                                callback_data="finished",
-                            )
-                        ]
-                    ]
-                ),
+                "✅ Вы уже прошли весь маршрут!\n"
+                "Нажмите кнопку «🏆 КВЕСТ ПРОЙДЕН», чтобы подтвердить.",
+                reply_markup=_quest_finished_keyboard(),
             )
             return
-
-        # Ищем точку по кодовому слову
-        point = db.get_point_by_code(text)
-        if point is None:
-            await message.answer("❌ Неверно. Попробуйте ещё раз.")
-            return
-
-        # Уже проходил эту точку?
-        if db.has_passed_point(user.id, point["id"]):
-            await message.answer(
-                "ℹ️ Эта точка уже пройдена. Ищите следующее кодовое слово!"
-            )
-            return
-
-        # Засчитываем точку
-        db.add_progress(user.id, point["id"])
-        logger.info(
-            "Пользователь %s прошёл точку #%s '%s'",
-            user.id,
-            point["id"],
-            html.quote(point["name"]),
-        )
-
-        passed = db.get_user_progress_count(user.id)
-        total = db.count_points()
 
         await message.answer(
-            f"✅ Точка «{html.quote(point['name'])}» пройдена!\n"
-            f"Прогресс: {passed}/{total}."
+            "💡 Кодовое слово нельзя ввести просто так — "
+            "нажмите кнопку <b>«▶️ Начать квест»</b>, "
+            "выберите локацию в табло и введите слово для неё.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="▶️ Начать квест",
+                        callback_data="quest:start",
+                    )]
+                ]
+            ),
         )
-
-        # Все точки пройдены — предлагаем подписаться
-        if db.has_completed_all(user.id):
-            await message.answer(
-                "🎉 <b>Поздравляем!</b> Вы прошли всю экскурсию!\n"
-                "Нажмите кнопку ниже, чтобы получать наши акции.",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="🎁 Прошёл всю экскурсию",
-                                callback_data="finished",
-                            )
-                        ]
-                    ]
-                ),
-            )
 
     return bot, dp
 

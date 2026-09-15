@@ -424,6 +424,10 @@ class AdminStates(StatesGroup):
     # Акция (промо)
     promo_text = State()
 
+    # Розыгрыш
+    draw_count = State()
+    draw_prizes = State()
+
 
 class QuestStates(StatesGroup):
     """Состояния машины состояний гостевого квеста."""
@@ -1363,9 +1367,11 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
             reply_markup=admin_menu_keyboard(),
         )
 
-    # ───────── Розыгрыш (через callback) ─────────
+    # ───────── Розыгрыш: пошаговый сценарий ─────────
     @router.callback_query(F.data == "admin:draw")
-    async def cb_admin_draw(callback: CallbackQuery) -> None:
+    async def cb_admin_draw(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
         if not callback.from_user or not is_admin(
             callback.from_user.id, settings.admin_chat_ids
         ):
@@ -1376,45 +1382,28 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
         if not completed:
             if callback.message:
                 await callback.message.edit_text(
-                    "❌ Победитель не может быть выбран: "
+                    "❌ Розыгрыш невозможен: "
                     "пока нет никого, кто прошёл всю экскурсию.",
                     reply_markup=admin_menu_keyboard(),
                 )
+            await state.clear()
             await callback.answer()
             return
 
-        winner = random.choice(completed)
-        user_id = winner["user_id"]
-        username = winner["username"]
-        first_name = winner["first_name"] or "—"
-
-        if username:
-            user_ref = f"@{html.quote(username)}"
-        else:
-            user_ref = html.quote(first_name)
-
-        logger.info(
-            "Розыгрыш через /admin: выбран пользователь %s среди %d",
-            user_id, len(completed),
-        )
-
-        text = (
-            "🏆 <b>Победитель розыгрыша</b>\n\n"
-            f"👤 Имя: <b>{html.quote(first_name)}</b>\n"
-            f"🔗 Username: {user_ref}\n"
-            f"🆔 User ID: <code>{user_id}</code>\n\n"
-            f"Всего участников: <b>{len(completed)}</b>"
-        )
+        await state.clear()
+        await state.set_state(AdminStates.draw_count)
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(
-                    text="🎲 Провести ещё раз", callback_data="admin:draw"
-                )],
-                [InlineKeyboardButton(
-                    text="↩️ В админ-меню", callback_data="admin:menu"
+                    text="↩️ Отмена", callback_data="admin:draw:cancel"
                 )],
             ]
+        )
+        text = (
+            "🎲 <b>Розыгрыш</b>\n\n"
+            f"Всего прошли экскурсию: <b>{len(completed)}</b> чел.\n\n"
+            "Введите <b>количество победителей</b> (целое число от 1 до 10):"
         )
         if callback.message:
             try:
@@ -1422,6 +1411,192 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
             except Exception:
                 await callback.message.answer(text, reply_markup=kb)
         await callback.answer()
+
+    @router.callback_query(
+        F.data == "admin:draw:cancel",
+        StateFilter(
+            AdminStates.draw_count,
+            AdminStates.draw_prizes,
+        ),
+    )
+    async def cb_draw_cancel(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await state.clear()
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    "❌ Розыгрыш отменён.",
+                    reply_markup=admin_menu_keyboard(),
+                )
+            except Exception:
+                await callback.message.answer(
+                    "❌ Розыгрыш отменён.",
+                    reply_markup=admin_menu_keyboard(),
+                )
+        await callback.answer()
+
+    @router.message(StateFilter(AdminStates.draw_count))
+    async def st_draw_count(message: Message, state: FSMContext) -> None:
+        if not message.text:
+            await message.answer(
+                "Введите целое число от 1 до 10:"
+            )
+            return
+        raw = message.text.strip()
+        try:
+            count = int(raw)
+        except ValueError:
+            await message.answer(
+                "Это не целое число. Попробуйте ещё раз (от 1 до 10):"
+            )
+            return
+        if not 1 <= count <= 10:
+            await message.answer(
+                "Число должно быть от 1 до 10. Попробуйте ещё раз:"
+            )
+            return
+
+        completed = db.get_completed_users()
+        if not completed:
+            await state.clear()
+            await message.answer(
+                "❌ Розыгрыш невозможен: пока нет участников, "
+                "прошедших экскурсию.",
+                reply_markup=admin_menu_keyboard(),
+            )
+            return
+
+        # Если участников меньше, чем запрошено — выбираем всех.
+        actual = min(count, len(completed))
+        winners = random.sample(completed, actual)
+
+        # Сохраняем победителей в FSM-стейт для следующего шага.
+        winners_data = [
+            {
+                "user_id": w["user_id"],
+                "username": w["username"],
+                "first_name": w["first_name"] or "—",
+            }
+            for w in winners
+        ]
+        await state.update_data(
+            draw_winners=winners_data,
+            draw_requested=count,
+        )
+        await state.set_state(AdminStates.draw_prizes)
+
+        # Подготовим список для предпросмотра.
+        winner_lines = []
+        for i, w in enumerate(winners_data, start=1):
+            if w["username"]:
+                ref = f"@{html.quote(w['username'])}"
+            else:
+                ref = html.quote(w["first_name"])
+            winner_lines.append(f"{i}. {ref}")
+
+        warning = ""
+        if actual < count:
+            warning = (
+                f"\n\n⚠️ Вы просили <b>{count}</b>, но участников всего "
+                f"<b>{len(completed)}</b>. Будет выбрано <b>{actual}</b>."
+            )
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="↩️ Отмена", callback_data="admin:draw:cancel"
+                )],
+            ]
+        )
+        await message.answer(
+            f"🎲 <b>Случайные победители:</b>\n\n"
+            + "\n".join(winner_lines)
+            + warning
+            + "\n\n🎁 Теперь введите <b>призы</b> — по одному в строке, "
+            f"всего <b>{actual}</b> шт., в том же порядке.\n\n"
+            "Пример:\n<code>Худи \"CHOKUDA\"\nФутболка \"CHOKUDA\"\nКепка \"CHOKUDA\"</code>",
+            reply_markup=kb,
+        )
+
+    @router.message(StateFilter(AdminStates.draw_prizes))
+    async def st_draw_prizes(message: Message, state: FSMContext) -> None:
+        if not message.text:
+            await message.answer(
+                "Отправьте призы текстом, по одному в строке:"
+            )
+            return
+
+        data = await state.get_data()
+        winners: list[dict] = data.get("draw_winners") or []
+        requested: int = int(data.get("draw_requested") or len(winners))
+        if not winners:
+            await state.clear()
+            await message.answer(
+                "Данные устарели. Начните розыгрыш заново через /admin.",
+                reply_markup=admin_menu_keyboard(),
+            )
+            return
+
+        # Разбиваем ввод на строки, убираем пустые.
+        raw_lines = [ln for ln in message.text.splitlines() if ln.strip()]
+        actual = len(winners)
+
+        if len(raw_lines) < actual:
+            await message.answer(
+                f"Нужно ввести <b>{actual}</b> призов (по одному в строке), "
+                f"а вы прислали <b>{len(raw_lines)}</b>.\n"
+                f"Попробуйте ещё раз:"
+            )
+            return
+
+        prizes = [ln.strip() for ln in raw_lines[:actual]]
+        # Если админ прислал лишние строки — обрежем, остальные проигнорируем.
+        if len(raw_lines) > actual:
+            logger.info(
+                "Админ прислал %d строк-призов, нужно %d — лишние проигнорированы",
+                len(raw_lines), actual,
+            )
+
+        # Формируем итоговый пост.
+        out_lines = ["🏆 <b>Победители розыгрыша:</b>", ""]
+        for prize, w in zip(prizes, winners):
+            if w["username"]:
+                ref = f"@{html.quote(w['username'])}"
+            else:
+                ref = html.quote(w["first_name"])
+            out_lines.append(f"{html.quote(prize)} — {ref}")
+
+        final_text = "\n".join(out_lines)
+
+        # Логируем розыгрыш.
+        logger.info(
+            "Розыгрыш: %d победителей (запрошено %d), участников всего %d",
+            actual, requested, len(winners),
+        )
+        for w in winners:
+            logger.info(
+                "  - победитель user_id=%s username=%s",
+                w["user_id"], w["username"],
+            )
+
+        await state.clear()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🎲 Новый розыгрыш", callback_data="admin:draw"
+                )],
+                [InlineKeyboardButton(
+                    text="↩️ В админ-меню", callback_data="admin:menu"
+                )],
+            ]
+        )
+        await message.answer(
+            "✅ <b>Готово!</b> Ниже — итоговый пост, "
+            "его можно скопировать и отправить в канал:\n\n"
+            + final_text,
+            reply_markup=kb,
+        )
 
     # ───────── Статистика (через callback) ─────────
     @router.callback_query(F.data == "admin:stats")

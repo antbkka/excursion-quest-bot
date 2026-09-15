@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router, html
 from aiogram.client.default import DefaultBotProperties
@@ -44,6 +45,9 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+# Московский часовой пояс (UTC+3, без перехода на летнее время).
+MSK: ZoneInfo = ZoneInfo("Europe/Moscow")
+
 # ─────────────────────────────────────────────────────────────
 # Настройка логирования
 # ─────────────────────────────────────────────────────────────
@@ -53,6 +57,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("excursion_bot")
+
+
+# Дата/время открытия экскурсии: 18 сентября 2026, 00:00 по московскому времени.
+EXCURSION_AVAILABLE_AT: datetime = datetime(2026, 9, 18, 0, 0, 0, tzinfo=MSK)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -642,62 +650,236 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
             html.quote(user.full_name),
         )
 
-        text = (
-            "👋 <b>Добро пожаловать на интерактивную экскурсию!</b>\n\n"
-            "Ниже — файл с описанием маршрута. "
-            "На каждой точке спрятано кодовое слово.\n\n"
-            "Когда найдёте кодовое слово — нажмите кнопку ниже "
-            "(«📍 Локация N пройдена»). Бот попросит ввести его.\n\n"
-            "Когда все точки пройдены — появится кнопка «🏆 КВЕСТ ПРОЙДЕН» 🎁"
+        # Приветствие (PDF НЕ отправляем — он станет доступен позже).
+        greeting = (
+            "Привет!\n"
+            "Ты присоединился к городскому квесту от CHOKUDA ко Дню города ❤️\n\n"
+            "С 18 по 20 сентября мы предлагаем тебе прогуляться по Ростову и "
+            "узнать интересные факты, заглянуть в любимые городские места, "
+            "выполнить интересные задания и собрать коллекцию уникальных штампов.\n\n"
+            "У тебя будет целых три дня, чтобы пройти все точки — "
+            "можно не спешить и выбрать удобный темп и маршрут."
         )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="❓ Как это работает?",
+                    callback_data="quest:how",
+                )]
+            ]
+        )
+        await message.answer(greeting, reply_markup=kb)
 
-        if settings.excursion_file_path.exists():
-            try:
-                doc = FSInputFile(settings.excursion_file_path)
-                await message.answer_document(
-                    document=doc,
-                    caption=text,
-                )
-            except Exception as exc:
-                logger.exception("Не удалось отправить файл экскурсии: %s", exc)
-                await message.answer(
-                    text + "\n\n⚠️ Не удалось прикрепить файл экскурсии."
-                )
-        else:
-            logger.warning(
-                "Файл экскурсии не найден по пути %s",
-                settings.excursion_file_path,
-            )
-            await message.answer(
-                text
-                + "\n\n⚠️ Файл экскурсии временно недоступен, "
-                  "обратитесь к администратору."
-            )
-
-        # Предлагаем начать/продолжить квест.
-        total = db.count_points()
-        if total == 0:
-            await message.answer(
-                "ℹ️ Квест ещё не настроен: администратор не добавил точки маршрута."
-            )
-        else:
-            await message.answer(
-                "🗺 Нажмите кнопку ниже, чтобы открыть табло локаций:",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(
-                            text="▶️ Начать квест",
-                            callback_data="quest:start",
-                        )]
-                    ]
-                ),
-            )
-
-        # Если это админ — сразу покажем подсказку про /admin
+        # Если это админ — сразу покажем подсказку про /admin.
         if is_admin(user.id, settings.admin_chat_ids):
             await message.answer(
                 "🛠 Вы администратор. Введите <code>/admin</code> для управления ботом."
             )
+
+    # ───────── Квест: «❓ Как это работает?» → инструкция ─────────
+    @router.callback_query(F.data == "quest:how")
+    async def cb_how_it_works(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await state.clear()
+        if not callback.from_user:
+            return
+
+        text = (
+            "<b>Как это работает?</b>\n\n"
+            "<b>1. Забери блокнот</b>\n"
+            "В JAM SMASH CAMP тебя будет ждать специальный блокнот "
+            "для прохождения квеста.\n\n"
+            "<b>2. Выбирай свой маршрут</b>\n"
+            "Можно пройти точки по нашему рекомендованному маршруту и параллельно "
+            "знакомиться с Ростовом через текстовую экскурсию в боте, а можно "
+            "посещать заведения в любом удобном порядке.\n\n"
+            "<b>3. Выполняй задания</b>\n"
+            "На каждой из 6 точек тебя ждёт интересное задание или вопрос. "
+            "Справился — получаешь уникальный штамп в свой блокнот.\n\n"
+            "<b>4. Не забудь про кодовое слово</b>\n"
+            "На каждой точке будет своё кодовое слово. Введи его в бот после "
+            "прохождения, так мы засчитаем локацию.\n\n"
+            "<b>5. Собери всё</b>\n"
+            "Твоя цель — собрать 6 штампов и 6 кодовых слов, чтобы подтвердить "
+            "прохождение квеста в боте.\n\n"
+            "Так ты попадёшь в розыгрыш суперпризов от заведений-партнёров, "
+            "а ещё получишь от них специальные скидки 👀\n\n"
+            "До встречи на квесте! ❤️"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="📄 Забрать экскурсию",
+                    callback_data="quest:pdf",
+                )],
+                [InlineKeyboardButton(
+                    text="↩️ Назад",
+                    callback_data="quest:back:start",
+                )],
+            ]
+        )
+        if callback.message:
+            try:
+                await callback.message.edit_text(text, reply_markup=kb)
+            except Exception:
+                await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+
+    # ───────── Квест: «↩️ Назад» → возврат на приветствие ─────────
+    @router.callback_query(F.data == "quest:back:start")
+    async def cb_back_to_start(callback: CallbackQuery) -> None:
+        if not callback.from_user:
+            return
+        greeting = (
+            "Привет!\n"
+            "Ты присоединился к городскому квесту от CHOKUDA ко Дню города ❤️\n\n"
+            "С 18 по 20 сентября мы предлагаем тебе прогуляться по Ростову и "
+            "узнать интересные факты, заглянуть в любимые городские места, "
+            "выполнить интересные задания и собрать коллекцию уникальных штампов.\n\n"
+            "У тебя будет целых три дня, чтобы пройти все точки — "
+            "можно не спешить и выбрать удобный темп и маршрут."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="❓ Как это работает?",
+                    callback_data="quest:how",
+                )]
+            ]
+        )
+        if callback.message:
+            try:
+                await callback.message.edit_text(greeting, reply_markup=kb)
+            except Exception:
+                await callback.message.answer(greeting, reply_markup=kb)
+        await callback.answer()
+
+    # ───────── Квест: «📄 Забрать экскурсию» → проверка даты ─────────
+    @router.callback_query(F.data == "quest:pdf")
+    async def cb_get_pdf(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await state.clear()
+        if not callback.from_user:
+            return
+        user_id = callback.from_user.id
+
+        now = datetime.now(MSK)
+        if now < EXCURSION_AVAILABLE_AT:
+            # Ещё рано — показываем сообщение и кнопку «Назад».
+            early_text = (
+                "Экскурсия будет доступна 18 сентября. "
+                "Заглядывай в пятницу! 📅"
+            )
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="↩️ Назад",
+                        callback_data="quest:how",
+                    )],
+                ]
+            )
+            if callback.message:
+                try:
+                    await callback.message.edit_text(early_text, reply_markup=kb)
+                except Exception:
+                    await callback.message.answer(early_text, reply_markup=kb)
+            await callback.answer()
+            return
+
+        # Экскурсия уже доступна — отправляем PDF и кнопку «▶️ Начать квест».
+        if not settings.excursion_file_path.exists():
+            logger.warning(
+                "Файл экскурсии не найден по пути %s",
+                settings.excursion_file_path,
+            )
+            err_text = (
+                "⚠️ Файл экскурсии временно недоступен, обратитесь к администратору."
+            )
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="↩️ Назад",
+                        callback_data="quest:how",
+                    )],
+                ]
+            )
+            if callback.message:
+                try:
+                    await callback.message.edit_text(err_text, reply_markup=kb)
+                except Exception:
+                    await callback.message.answer(err_text, reply_markup=kb)
+            await callback.answer()
+            return
+
+        # Короткое сопроводительное сообщение под PDF.
+        caption = (
+            "📖 <b>Текстовая экскурсия по Ростову</b>\n\n"
+            "Здесь — описание маршрута, интересные факты и подсказки. "
+            "На каждой точке спрятано кодовое слово — его нужно ввести "
+            "в бот после прохождения.\n\n"
+            "Когда будешь готов — нажми кнопку ниже."
+        )
+        try:
+            doc = FSInputFile(settings.excursion_file_path)
+            await callback.bot.send_document(
+                chat_id=user_id,
+                document=doc,
+                caption=caption,
+            )
+        except Exception as exc:
+            logger.exception("Не удалось отправить файл экскурсии: %s", exc)
+            err_text = "⚠️ Не удалось прикрепить файл экскурсии. Попробуйте позже."
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="↩️ Назад",
+                        callback_data="quest:how",
+                    )],
+                ]
+            )
+            if callback.message:
+                try:
+                    await callback.message.edit_text(err_text, reply_markup=kb)
+                except Exception:
+                    await callback.message.answer(err_text, reply_markup=kb)
+            await callback.answer()
+            return
+
+        # После PDF отправляем отдельное сообщение с кнопкой «▶️ Начать квест».
+        total = db.count_points()
+        if total == 0:
+            quest_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="↩️ Назад",
+                        callback_data="quest:how",
+                    )],
+                ]
+            )
+            await callback.message.answer(  # type: ignore[union-attr]
+                "ℹ️ Квест ещё не настроен: администратор не добавил точки маршрута.",
+                reply_markup=quest_kb,
+            )
+        else:
+            quest_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="▶️ Начать квест",
+                        callback_data="quest:start",
+                    )],
+                    [InlineKeyboardButton(
+                        text="↩️ Назад",
+                        callback_data="quest:how",
+                    )],
+                ]
+            )
+            await callback.message.answer(  # type: ignore[union-attr]
+                "🗺 Нажмите кнопку ниже, чтобы открыть табло локаций:",
+                reply_markup=quest_kb,
+            )
+        await callback.answer()
 
     # ───────── /admin — главное меню админки ─────────
     @router.message(Command("admin"))

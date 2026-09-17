@@ -32,9 +32,9 @@
 |---|---|---|
 | ![start](docs/screenshots/start.png) | ![how](docs/screenshots/how_it_works.png) | ![scheduled](docs/screenshots/scheduled.png) |
 
-| PDF с экскурсией | Табло локаций | Ввод кодового слова |
-|---|---|---|
-| ![pdf](docs/screenshots/pdf.png) | ![board](docs/screenshots/quest_board.png) | ![code](docs/screenshots/code_input.png) |
+| Табло локаций | Ввод кодового слова |
+|---|---|
+| ![board](docs/screenshots/quest_board.png) | ![code](docs/screenshots/code_input.png) |
 
 | Админ-панель |
 |---|

@@ -2411,9 +2411,15 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
         if first_time:
             promos = db.get_all_promos()
             if promos:
-                lines = "\n".join(f"• {p['text']}" for p in promos)
+                body = "\n\n".join(promo["text"] for promo in promos)
                 await callback.message.answer(
-                    "🎁 <b>Ваши бонусы от заведений-партнёров:</b>\n\n" + lines
+                    "🎉 Круто! Квест пройден, так что лови бонусы от заведений:\n\n"
+                    + body
+                )
+            else:
+                await callback.message.answer(
+                    "🎉 Круто! Квест пройден! "
+                    "Бонусы от заведений появятся здесь в ближайшее время."
                 )
 
     # ───────── Совместимость со старой кнопкой «finished» ─────────

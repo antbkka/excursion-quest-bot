@@ -216,14 +216,19 @@ class Database:
                 (user_id, username, first_name),
             )
 
-    def mark_user_passed(self, user_id: int) -> None:
-        """Помечает, что пользователь прошёл всю экскурсию (passed_at)."""
+    def mark_user_passed(self, user_id: int) -> bool:
+        """
+        Помечает, что пользователь прошёл всю экскурсию (passed_at).
+        Возвращает True, если прохождение отмечено впервые,
+        и False, если passed_at уже был установлен ранее.
+        """
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE users SET passed_at = datetime('now') "
                 "WHERE user_id = ? AND passed_at IS NULL",
                 (user_id,),
             )
+            return cur.rowcount > 0
 
     def mark_user_blocked(self, user_id: int) -> None:
         """Помечает пользователя как заблокировавшего бота."""
@@ -373,6 +378,13 @@ class Database:
                 f"UPDATE promos SET sent_at = datetime('now') WHERE id IN ({placeholders})",
                 promo_ids,
             )
+
+    def get_all_promos(self) -> list[sqlite3.Row]:
+        """Возвращает все акции из таблицы promos (отсортированы по id)."""
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT id, text FROM promos ORDER BY id"
+            ).fetchall()
 
     # ───── stats ─────
     def get_stats(self) -> dict:
@@ -2381,13 +2393,28 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
                     pass
             return
 
-        db.mark_user_passed(user_id)
-        logger.info("Пользователь %s отметил прохождение экскурсии", user_id)
+        first_time = db.mark_user_passed(user_id)
+        logger.info(
+            "Пользователь %s отметил прохождение экскурсии (first_time=%s)",
+            user_id,
+            first_time,
+        )
         await callback.answer("Спасибо! 🎉")
-        if callback.message:
-            await callback.message.answer(
-                "Спасибо! Теперь вы будете получать наши акции и новости. 🎁"
-            )
+        if not callback.message:
+            return
+
+        await callback.message.answer(
+            "Спасибо! Теперь вы будете получать наши акции и новости. 🎁"
+        )
+
+        # Список акций отправляем только один раз — при первом прохождении.
+        if first_time:
+            promos = db.get_all_promos()
+            if promos:
+                lines = "\n".join(f"• {p['text']}" for p in promos)
+                await callback.message.answer(
+                    "🎁 <b>Ваши бонусы от заведений-партнёров:</b>\n\n" + lines
+                )
 
     # ───────── Совместимость со старой кнопкой «finished» ─────────
     @router.callback_query(F.data == "finished")

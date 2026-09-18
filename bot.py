@@ -42,6 +42,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    PhotoSize,
 )
 from dotenv import load_dotenv
 
@@ -440,6 +441,7 @@ class AdminStates(StatesGroup):
 
     # Рассылка
     broadcast_text = State()
+    broadcast_photo = State()
 
     # Акция (промо)
     promo_text = State()
@@ -1489,8 +1491,132 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
             await message.answer("Текст не может быть пустым. Введите текст рассылки:")
             return
 
-        users = db.get_subscribed_users()
+        # Сохраняем текст и предлагаем прикрепить фото (опционально)
+        await state.update_data(broadcast_text=text)
+        await state.set_state(AdminStates.broadcast_photo)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⏭ Пропустить", callback_data="admin:broadcast:skip_photo"
+                    )
+                ],
+                [InlineKeyboardButton(text="↩️ Отмена", callback_data="admin:menu")],
+            ]
+        )
+        await message.answer(
+            "📷 <b>Фото для рассылки</b>\n\n"
+            "Пришлите изображение, которое нужно прикрепить к рассылке, "
+            "или нажмите «⏭ Пропустить», чтобы отправить только текст.",
+            reply_markup=kb,
+        )
+
+    @router.callback_query(
+        F.data == "admin:broadcast:skip_photo",
+        StateFilter(AdminStates.broadcast_photo),
+    )
+    async def cb_broadcast_skip_photo(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        """Пользователь решил не прикреплять фото — выполняем рассылку текстом."""
+        if not callback.from_user or not is_admin(
+            callback.from_user.id, settings.admin_chat_ids
+        ):
+            await callback.answer("⛔ Нет доступа.", show_alert=True)
+            return
+
+        data = await state.get_data()
+        text = data.get("broadcast_text", "")
         await state.clear()
+
+        users = db.get_subscribed_users()
+        if not users:
+            if callback.message:
+                await callback.message.answer(
+                    "Нет подписчиков для рассылки.",
+                    reply_markup=admin_menu_keyboard(),
+                )
+            await callback.answer()
+            return
+
+        if callback.message:
+            await callback.message.answer(
+                f"⏳ Начинаю рассылку {len(users)} подписчикам…",
+                reply_markup=admin_menu_keyboard(),
+            )
+
+        sent, blocked = await _do_broadcast(bot, db, text, users, photo=None)
+        if callback.message:
+            await callback.message.answer(
+                f"📤 Рассылка завершена.\n"
+                f"Отправлено: <b>{sent}</b>\n"
+                f"Заблокировали бота: <b>{blocked}</b>",
+                reply_markup=admin_menu_keyboard(),
+            )
+        await callback.answer()
+
+    @router.message(StateFilter(AdminStates.broadcast_photo))
+    async def st_broadcast_photo(message: Message, state: FSMContext) -> None:
+        """Принимаем фото (или команду 'Пропустить') и запускаем рассылку."""
+        data = await state.get_data()
+        text = data.get("broadcast_text", "")
+
+        # Команда «Пропустить» текстом
+        if message.text and message.text.strip().lower() in {
+            "пропустить",
+            "⏭ пропустить",
+            "skip",
+        }:
+            await state.clear()
+            users = db.get_subscribed_users()
+            if not users:
+                await message.answer(
+                    "Нет подписчиков для рассылки.",
+                    reply_markup=admin_menu_keyboard(),
+                )
+                return
+            await message.answer(
+                f"⏳ Начинаю рассылку {len(users)} подписчикам…",
+                reply_markup=admin_menu_keyboard(),
+            )
+            sent, blocked = await _do_broadcast(bot, db, text, users, photo=None)
+            await message.answer(
+                f"📤 Рассылка завершена.\n"
+                f"Отправлено: <b>{sent}</b>\n"
+                f"Заблокировали бота: <b>{blocked}</b>",
+                reply_markup=admin_menu_keyboard(),
+            )
+            return
+
+        # Должно прийти изображение
+        photo: PhotoSize | None = None
+        if message.photo:
+            photo = message.photo[-1]  # берём самый большой размер
+        elif message.document and message.document.mime_type:
+            # Поддержим фото, отправленное как документ с image/*
+            if message.document.mime_type.startswith("image/"):
+                photo = message.document  # type: ignore[assignment]
+
+        if photo is None:
+            await message.answer(
+                "Это не похоже на изображение. Пришлите фото "
+                "или нажмите «⏭ Пропустить».",
+            )
+            return
+
+        # Проверка размера файла (Telegram Bot API: до 10 МБ на скачивание,
+        # до 50 МБ при отправке по file_id). Защитимся от слишком больших.
+        max_bytes = 10 * 1024 * 1024
+        file_size = getattr(photo, "file_size", None)
+        if file_size is not None and file_size > max_bytes:
+            await message.answer(
+                "❌ Фото слишком большое (больше 10 МБ). "
+                "Сожмите изображение и пришлите заново, или нажмите «⏭ Пропустить».",
+            )
+            return
+
+        await state.clear()
+        users = db.get_subscribed_users()
         if not users:
             await message.answer(
                 "Нет подписчиков для рассылки.",
@@ -1503,7 +1629,13 @@ def build_bot(settings: Settings, db: Database) -> tuple[Bot, Dispatcher]:
             reply_markup=admin_menu_keyboard(),
         )
 
-        sent, blocked = await _do_broadcast(bot, db, text, users)
+        sent, blocked = await _do_broadcast(
+            bot,
+            db,
+            text,
+            users,
+            photo=photo.file_id,  # type: ignore[union-attr]
+        )
         await message.answer(
             f"📤 Рассылка завершена.\n"
             f"Отправлено: <b>{sent}</b>\n"
@@ -2506,9 +2638,15 @@ async def _do_broadcast(
     db: Database,
     text: str,
     users: list[sqlite3.Row],
+    photo: str | None = None,
 ) -> tuple[int, int]:
     """
     Рассылает text списку users.
+
+    Если передан photo (file_id или URL), отправляется сообщение
+    с картинкой через send_photo(chat_id, photo=photo, caption=text).
+    Если photo не передан — отправляется только текст через send_message.
+
     Возвращает кортеж (успешно отправлено, заблокировали бота).
     """
     sent = 0
@@ -2516,7 +2654,14 @@ async def _do_broadcast(
     for row in users:
         user_id = row["user_id"]
         try:
-            await bot.send_message(user_id, text)
+            if photo:
+                await bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo,
+                    caption=text,
+                )
+            else:
+                await bot.send_message(chat_id=user_id, text=text)
             sent += 1
         except TelegramForbiddenError:
             # Пользователь заблокировал бота
